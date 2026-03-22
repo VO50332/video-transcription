@@ -5,11 +5,19 @@ import tempfile
 import json
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template, send_file
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
 OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
+
+UPLOADS_DIR = Path(__file__).parent / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.mp3', '.wav', '.m4a', '.ogg', '.flac'}
+MAX_UPLOAD_MB = 500
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 
 # In-memory job store: job_id -> {"status", "progress", "transcript", "summary", "pptx_path", "txt_path", "error"}
 jobs = {}
@@ -44,6 +52,17 @@ def extract_audio(video_url: str, cookies: str | None, out_path: str) -> None:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
+
+
+def extract_audio_from_file(input_path: str, out_path: str) -> None:
+    """Use ffmpeg to extract/convert audio from a local video/audio file."""
+    import subprocess
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", input_path, "-vn", "-ar", "16000", "-ac", "1", "-q:a", "0", out_path],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[-500:]}")
 
 
 def transcribe_audio(audio_path: str, model_size: str = "base") -> str:
@@ -285,6 +304,52 @@ def run_job(job_id: str, video_url: str, cookies: str | None, whisper_model: str
             job["progress"] = f"Error: {e}"
 
 
+def run_job_file(job_id: str, upload_path: str, original_name: str, whisper_model: str):
+    job = jobs[job_id]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_file = os.path.join(tmpdir, "audio.mp3")
+
+        try:
+            job["progress"] = "Extracting audio from uploaded file…"
+            extract_audio_from_file(upload_path, audio_file)
+
+            job["progress"] = f"Transcribing audio with Whisper ({whisper_model})… this may take a few minutes."
+            transcript = transcribe_audio(audio_file, whisper_model)
+            job["transcript"] = transcript
+
+            job["progress"] = "Generating summary and slides with Claude AI…"
+            summary, slides = generate_summary_and_slides(transcript, original_name)
+            job["summary"] = summary
+
+            job["progress"] = "Building PowerPoint presentation…"
+            pptx_path = str(OUTPUTS_DIR / f"{job_id}.pptx")
+            build_pptx(slides, summary, pptx_path, original_name)
+            job["pptx_path"] = pptx_path
+
+            txt_path = str(OUTPUTS_DIR / f"{job_id}_transcript.txt")
+            with open(txt_path, "w") as f:
+                f.write(f"FILE: {original_name}\n\n")
+                f.write("=== SUMMARY ===\n\n")
+                f.write(summary + "\n\n")
+                f.write("=== FULL TRANSCRIPT ===\n\n")
+                f.write(transcript)
+            job["txt_path"] = txt_path
+
+            job["status"] = "done"
+            job["progress"] = "Complete!"
+
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["progress"] = f"Error: {e}"
+        finally:
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -316,6 +381,41 @@ def transcribe():
     }
 
     t = threading.Thread(target=run_job, args=(job_id, video_url, cookies, whisper_model), daemon=True)
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    ext = Path(f.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+    whisper_model = request.form.get("model", "base")
+    original_name = secure_filename(f.filename)
+    job_id = str(uuid.uuid4())
+    save_path = str(UPLOADS_DIR / f"{job_id}{ext}")
+    f.save(save_path)
+
+    jobs[job_id] = {
+        "status": "running",
+        "progress": "Starting…",
+        "transcript": None,
+        "summary": None,
+        "pptx_path": None,
+        "txt_path": None,
+        "error": None,
+    }
+
+    t = threading.Thread(target=run_job_file, args=(job_id, save_path, original_name, whisper_model), daemon=True)
     t.start()
 
     return jsonify({"job_id": job_id})

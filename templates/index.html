@@ -213,6 +213,54 @@
       font-size: 0.8rem;
       text-align: center;
     }
+
+    .mode-toggle {
+      display: flex;
+      gap: 0;
+      margin-bottom: 1.4rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .mode-btn {
+      flex: 1;
+      padding: 0.55rem 0;
+      border: none;
+      border-radius: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .mode-btn.active {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem 1rem;
+      text-align: center;
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(233,79,55,0.05);
+    }
+
+    .drop-zone input[type="file"] { display: none; }
+
+    .drop-zone .drop-label { font-size: 1rem; margin-bottom: 0.4rem; color: var(--text); }
+    .drop-zone .drop-hint { font-size: 0.82rem; }
+    #file-name { margin-top: 0.6rem; font-size: 0.85rem; color: var(--accent2); min-height: 1.2em; }
   </style>
 </head>
 <body>
@@ -224,9 +272,31 @@
 
 <!-- Input card -->
 <div class="card">
-  <div class="field">
-    <label for="url">Video URL</label>
-    <input type="url" id="url" placeholder="https://example.com/video/..." autocomplete="off" />
+  <div class="mode-toggle">
+    <button class="mode-btn active" id="btn-url" onclick="setMode('url')">&#127760; URL</button>
+    <button class="mode-btn" id="btn-file" onclick="setMode('file')">&#128190; Upload File</button>
+  </div>
+
+  <!-- URL mode -->
+  <div id="mode-url">
+    <div class="field">
+      <label for="url">Video URL</label>
+      <input type="url" id="url" placeholder="https://example.com/video/..." autocomplete="off" />
+    </div>
+  </div>
+
+  <!-- File upload mode -->
+  <div id="mode-file" style="display:none">
+    <div class="field">
+      <label>Video or Audio File</label>
+      <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()"
+           ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event)">
+        <input type="file" id="file-input" accept=".mp4,.mkv,.avi,.mov,.webm,.mp3,.wav,.m4a,.ogg,.flac" onchange="onFileChange(event)" />
+        <div class="drop-label">&#8673; Click to choose file or drag &amp; drop here</div>
+        <div class="drop-hint">Supported: MP4, MKV, AVI, MOV, WEBM, MP3, WAV, M4A, OGG, FLAC &mdash; max 500 MB</div>
+        <div id="file-name"></div>
+      </div>
+    </div>
   </div>
 
   <details>
@@ -290,8 +360,33 @@
 let currentJobId = null;
 let pollInterval = null;
 let progressStep = 0;
+let currentMode = 'url';
 
-const STEPS = [10, 30, 60, 85, 95]; // fake visual progress stages
+const STEPS = [10, 30, 60, 85, 95];
+
+function setMode(mode) {
+  currentMode = mode;
+  document.getElementById('mode-url').style.display = mode === 'url' ? '' : 'none';
+  document.getElementById('mode-file').style.display = mode === 'file' ? '' : 'none';
+  document.getElementById('btn-url').classList.toggle('active', mode === 'url');
+  document.getElementById('btn-file').classList.toggle('active', mode === 'file');
+}
+
+function onDragOver(e) { e.preventDefault(); document.getElementById('drop-zone').classList.add('drag-over'); }
+function onDragLeave(e) { document.getElementById('drop-zone').classList.remove('drag-over'); }
+function onDrop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').classList.remove('drag-over');
+  const files = e.dataTransfer.files;
+  if (files.length) {
+    document.getElementById('file-input').files = files;
+    document.getElementById('file-name').textContent = files[0].name;
+  }
+}
+function onFileChange(e) {
+  const f = e.target.files[0];
+  document.getElementById('file-name').textContent = f ? f.name : '';
+}
 
 function showError(msg) {
   const el = document.getElementById('error-msg');
@@ -305,10 +400,6 @@ function hideError() {
 
 async function startJob() {
   hideError();
-  const url = document.getElementById('url').value.trim();
-  if (!url) { showError('Please enter a video URL.'); return; }
-
-  const cookies = document.getElementById('cookies').value.trim();
   const model = document.getElementById('model').value;
 
   document.getElementById('start-btn').disabled = true;
@@ -318,11 +409,25 @@ async function startJob() {
   setProgress(5, 'Submitting…');
 
   try {
-    const res = await fetch('/transcribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, cookies, model }),
-    });
+    let res;
+    if (currentMode === 'url') {
+      const url = document.getElementById('url').value.trim();
+      if (!url) { showError('Please enter a video URL.'); resetUI(); return; }
+      const cookies = document.getElementById('cookies').value.trim();
+      res = await fetch('/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, cookies, model }),
+      });
+    } else {
+      const fileInput = document.getElementById('file-input');
+      if (!fileInput.files.length) { showError('Please choose a file.'); resetUI(); return; }
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      formData.append('model', model);
+      res = await fetch('/upload', { method: 'POST', body: formData });
+    }
+
     const data = await res.json();
     if (data.error) { throw new Error(data.error); }
     currentJobId = data.job_id;
